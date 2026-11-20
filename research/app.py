@@ -6,6 +6,7 @@ Expected .env variables:
     OPENAI_API_KEY=...
     TAVILY_API_KEY=...
     WEATHERSTACK_API_KEY=...
+    APP_PASSWORD=...  # password required to open the Streamlit app
     OPENAI_MODEL=gpt-6-luna  # optional; defaults to the model used in the project
 
 API keys are loaded from .env and are never displayed in the interface.
@@ -13,6 +14,7 @@ API keys are loaded from .env and are never displayed in the interface.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from pathlib import Path
@@ -65,6 +67,7 @@ ENV_PATH = load_project_env()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 WEATHERSTACK_API_KEY = os.getenv("WEATHERSTACK_API_KEY", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 # Keep the model setting used by the existing project.
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
@@ -79,6 +82,59 @@ st.set_page_config(
     page_icon="🤖",
     layout="centered",
 )
+
+
+# =============================================================================
+# PASSWORD GATE
+# =============================================================================
+
+def require_app_password() -> None:
+    """Require the shared application password before showing the agent UI."""
+
+    # Fail closed: never expose the agent if the password was not configured.
+    if not APP_PASSWORD:
+        st.title("🔒 Private Agent Access")
+        st.error("The application password has not been configured.")
+        st.info(
+            "Set APP_PASSWORD in your local .env file and in Render's "
+            "Environment Variables, then restart or redeploy the app."
+        )
+        st.stop()
+
+    if st.session_state.get("authenticated", False):
+        return
+
+    st.title("🔒 Private Agent Access")
+    st.caption("This is a private application. Enter your password to continue.")
+
+    with st.form("private_login_form", clear_on_submit=True):
+        entered_password = st.text_input(
+            "Application password",
+            type="password",
+            placeholder="Enter your password",
+        )
+        login_submitted = st.form_submit_button(
+            "Log in",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if login_submitted:
+        entered_bytes = entered_password.encode("utf-8")
+        expected_bytes = APP_PASSWORD.encode("utf-8")
+
+        if hmac.compare_digest(entered_bytes, expected_bytes):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password. Please try again.")
+
+    # Stop execution so unauthenticated visitors cannot reach the agent UI
+    # or trigger any OpenAI, Tavily, or Weatherstack requests.
+    st.stop()
+
+
+require_app_password()
 
 st.title("🤖 Agentic AI Assistant")
 st.markdown(
@@ -424,7 +480,7 @@ def extract_agent_output(result: dict[str, Any]) -> tuple[str, list[dict[str, An
 
 with st.sidebar:
     st.header("⚙️ Configuration")
-    st.caption("API keys are read from your local .env file.")
+    st.caption("API keys and the app password are read from environment variables. Locally, these can be stored in .env.")
 
     if ENV_PATH:
         st.write("Environment file:", str(ENV_PATH))
@@ -450,6 +506,12 @@ with st.sidebar:
 
     st.divider()
     st.caption("Your API keys are never displayed in this app.")
+
+    if st.button("Log out", use_container_width=True):
+        st.session_state["authenticated"] = False
+        for key in ("last_question", "last_answer", "last_steps"):
+            st.session_state.pop(key, None)
+        st.rerun()
 
 
 # =============================================================================
