@@ -1,20 +1,19 @@
 """
 Agentic AI Assistant
-Streamlit UI + LangChain ReAct agent + Tavily web search + Weatherstack current weather.
-
-Based on the user's working agent_demo.ipynb and the instructor's Streamlit screenshots.
+Streamlit + LangChain create_agent + Tavily web search + Weatherstack current weather.
 
 Expected .env variables:
     OPENAI_API_KEY=...
     TAVILY_API_KEY=...
     WEATHERSTACK_API_KEY=...
-    OPENAI_MODEL=gpt-6-luna   # optional; defaults to the model used in the notebook
+    OPENAI_MODEL=gpt-6-luna  # optional; defaults to the model used in the project
 
-The API keys are loaded from .env and are never displayed in the interface.
+API keys are loaded from .env and are never displayed in the interface.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -24,23 +23,14 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain_core.prompts import PromptTemplate
-from langchain_core.tools import tool
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
-from langchain_classic.agents import AgentExecutor, create_react_agent
-
-# LangSmith is used by the original notebook to retrieve its public ReAct prompt.
-# The app also has a local fallback prompt in case the prompt cannot be downloaded.
-try:
-    from langsmith import Client
-except ImportError:
-    Client = None
 
 
-# ============================================================
+# =============================================================================
 # ENVIRONMENT AND API KEYS
-# ============================================================
+# =============================================================================
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 
@@ -48,13 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def load_project_env() -> Path | None:
-    """
-    Find .env whether app.py is saved in the project root or research folder.
-
-    Preferred locations:
-      - C:\\Langchain-Agent\\research\\.env
-      - C:\\Langchain-Agent\\.env
-    """
+    """Find .env whether app.py is saved in the project root or research folder."""
     if SCRIPT_DIR.name.lower() == "research":
         candidates = [
             SCRIPT_DIR / ".env",
@@ -82,13 +66,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 WEATHERSTACK_API_KEY = os.getenv("WEATHERSTACK_API_KEY", "").strip()
 
-# This is the model used in the supplied working notebook.
+# Keep the model setting used by the existing project.
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
 
 
-# ============================================================
+# =============================================================================
 # STREAMLIT PAGE CONFIGURATION
-# ============================================================
+# =============================================================================
 
 st.set_page_config(
     page_title="Agentic AI Assistant",
@@ -106,24 +90,27 @@ st.caption(
 st.divider()
 
 
-# ============================================================
+# =============================================================================
 # WEATHERSTACK TOOL
-# ============================================================
+# =============================================================================
 
 def create_weather_tool(api_key: str):
     """Create a LangChain tool that retrieves current weather from Weatherstack."""
 
+    from langchain_core.tools import tool
+
     @tool("get_weather_data")
     def get_weather_data(city: str) -> str:
         """
-        Fetch current temperature, weather description, humidity and wind for a city.
+        Fetch current weather for a city using Weatherstack.
+
+        Use this tool whenever the user asks for current or live weather.
         Input should be a city name, optionally followed by a country.
+        Returns temperature in Celsius, weather description, humidity,
+        wind speed, wind direction and the local observation time.
         """
         if not api_key:
-            return (
-                "Weather lookup is unavailable because WEATHERSTACK_API_KEY "
-                "has not been configured."
-            )
+            return "Weather lookup is unavailable because WEATHERSTACK_API_KEY is not configured."
 
         try:
             response = requests.get(
@@ -134,11 +121,12 @@ def create_weather_tool(api_key: str):
                     "units": "m",
                 },
                 timeout=20,
+                verify=certifi.where(),
             )
             response.raise_for_status()
             data = response.json()
 
-            # Weatherstack may return an API error even when HTTP status is 200.
+            # Weatherstack can return an API error even when HTTP status is 200.
             if data.get("success") is False or "error" in data:
                 error = data.get("error") or {}
                 code = error.get("code", "unknown")
@@ -157,9 +145,11 @@ def create_weather_tool(api_key: str):
             place = location.get("name") or city
             country = location.get("country") or ""
             place_label = f"{place}, {country}" if country else place
+            local_time = location.get("localtime") or "Not available"
 
             return (
                 f"Location: {place_label}\n"
+                f"Local time: {local_time}\n"
                 f"Temperature: {current.get('temperature', 'N/A')}°C\n"
                 f"Weather: {description}\n"
                 f"Humidity: {current.get('humidity', 'N/A')}%\n"
@@ -169,11 +159,11 @@ def create_weather_tool(api_key: str):
 
         except requests.Timeout:
             return f"The Weatherstack request timed out while checking {city}."
-        except requests.RequestException as exc:
-            # Avoid printing the full request URL because it may contain the API key.
+        except requests.RequestException:
+            # Do not expose the request URL because it may contain the API key.
             return (
-                f"The Weatherstack request failed ({type(exc).__name__}). "
-                "Please check your connection and API access."
+                "The Weatherstack request failed. "
+                "Please check the network connection and Weatherstack API access."
             )
         except (ValueError, TypeError, KeyError):
             return f"Could not interpret the Weatherstack response for {city}."
@@ -181,101 +171,256 @@ def create_weather_tool(api_key: str):
     return get_weather_data
 
 
-# ============================================================
-# REACT PROMPT
-# ============================================================
+# =============================================================================
+# AGENT INSTRUCTIONS
+# =============================================================================
 
-def get_react_prompt():
-    """
-    Use the same public LangSmith ReAct prompt as the supplied notebook.
-    If it cannot be retrieved, use a local prompt with the same variables.
-    """
-    if Client is not None:
-        try:
-            langsmith_client = Client()
-            return langsmith_client.pull_prompt(
-                "hwchase17/react",
-                dangerously_pull_public_prompt=True,
-            )
-        except Exception:
-            pass
+SYSTEM_PROMPT = """
+You are an accurate research and weather assistant.
 
-    return PromptTemplate.from_template(
-        """Answer the following question as accurately as possible.
-You have access to the following tools:
+AVAILABLE TOOLS
+- tavily_search: searches the web and returns search results.
+- get_weather_data: retrieves current weather from Weatherstack.
 
-{tools}
+TOOL SELECTION
+1. If the user asks for current/live weather, call get_weather_data.
+2. If the user asks for web research, facts, opening hours, or source URLs,
+   call tavily_search.
+3. If the user asks for both weather and web research, use both tools.
+   Gather the required information before writing the final answer.
+4. Do not invent current weather, search results, facts, or URLs.
 
-Use this format:
-Question: the user's question
-Thought: what information is needed
-Action: one of [{tool_names}]
-Action Input: the input for the selected tool
-Observation: the tool result
-... (repeat Thought/Action/Action Input/Observation when needed)
-Thought: I now know the final answer
-Final Answer: the answer to the original question
+OFFICIAL-SOURCE AND SOURCE-QUALITY RULES
+1. If the user explicitly asks for an official source, official website,
+   official opening hours, or information from a named organisation, use
+   Tavily's include_domains argument to restrict the search to the relevant
+   official domain whenever it can be identified.
+2. If the official domain is not known, first identify the organisation's
+   official website. Then search that domain for the requested information.
+3. Do not describe a third-party website as an official source.
+4. If an official source cannot be found, clearly say that it could not be
+   verified from an official source. Do not silently substitute a third-party
+   source.
+5. Prefer primary sources and official organisation websites over blogs,
+   travel sites, aggregators, and general reference sites.
+6. If sources disagree, explain the discrepancy and prefer the official
+   source. Do not combine conflicting details as though they agree.
 
-Begin!
+ANSWER FORMAT
+- Answer the user's question directly.
+- Use clear headings and concise bullet points when helpful.
+- For web-derived facts, include clickable Markdown links using the exact
+  URLs returned by Tavily. Never fabricate or rewrite a source URL.
+- Make clear which details come from Weatherstack and include its local
+  observation time when available.
+- If a requested detail is missing from the tool results, say it is unavailable
+  rather than guessing.
+- For recommendations, explain the reasoning and distinguish facts from
+  recommendations.
+"""
 
-Question: {input}
-Thought:{agent_scratchpad}"""
-    )
 
-
-# ============================================================
-# BUILD THE LANGCHAIN AGENT
-# ============================================================
+# =============================================================================
+# BUILD AND CACHE THE LANGCHAIN AGENT
+# =============================================================================
 
 @st.cache_resource(show_spinner=False)
-def build_agent_executor(
+def build_agent(
     openai_key: str,
     tavily_key: str,
     weatherstack_key: str,
     model_name: str,
-) -> AgentExecutor:
-    """Build and cache the LLM, tools and ReAct agent."""
+):
+    """Build and cache the LLM, tools and LangChain agent."""
 
-    # TavilySearch reads its key from the environment.
     os.environ["OPENAI_API_KEY"] = openai_key
     os.environ["TAVILY_API_KEY"] = tavily_key
 
-    # Match the working notebook's ChatOpenAI Responses API configuration.
     llm = ChatOpenAI(
         model=model_name,
         api_key=openai_key,
         use_responses_api=True,
     )
 
-    # Same Tavily integration and max_results setting as the notebook.
-    search_tool = TavilySearch(max_results=2)
-    tools: list[Any] = [search_tool]
+    # Tavily supports include_domains at tool-call time. The system prompt
+    # instructs the agent to use it for requests requiring official sources.
+    search_tool = TavilySearch(
+        max_results=5,
+        topic="general",
+        search_depth="basic",
+        include_answer=False,
+        include_raw_content="markdown",
+    )
+    search_tool.description = (
+        "Search the web for reliable information. "
+        "Use include_domains to restrict results to an official website when "
+        "the user requests official information or names an organisation. "
+        "The tool accepts query and optional include_domains/exclude_domains."
+    )
 
-    # Weatherstack is optional: search remains available if its key is absent.
+    tools = [search_tool]
+
+    # Weatherstack is optional; Tavily web search remains available without it.
     if weatherstack_key:
         tools.append(create_weather_tool(weatherstack_key))
 
-    prompt = get_react_prompt()
-
-    agent = create_react_agent(
-        llm=llm,
+    agent = create_agent(
+        model=llm,
         tools=tools,
-        prompt=prompt,
+        system_prompt=SYSTEM_PROMPT,
     )
 
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=5,
-        return_intermediate_steps=True,
-    )
+    return agent
 
 
-# ============================================================
+# =============================================================================
+# HELPERS: FORMAT AGENT OUTPUT AND TOOL ACTIVITY
+# =============================================================================
+
+def content_to_text(content: Any) -> str:
+    """Convert LangChain message content into readable text."""
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif "text" in block:
+                    parts.append(str(block["text"]))
+            elif hasattr(block, "text"):
+                parts.append(str(block.text))
+        return "\n".join(part for part in parts if part).strip()
+
+    return str(content)
+
+
+def summarize_tavily_result(content: Any) -> str:
+    """Turn Tavily's full JSON response into a short readable activity summary."""
+    raw_text = content_to_text(content)
+
+    try:
+        data = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
+    except (json.JSONDecodeError, TypeError):
+        return raw_text[:2500]
+
+    if not isinstance(data, dict):
+        return str(data)[:2500]
+
+    lines: list[str] = []
+
+    query = data.get("query")
+    if query:
+        lines.append(f"**Search query:** {query}")
+
+    results = data.get("results") or []
+    if not results:
+        lines.append("No search results were returned.")
+        return "\n\n".join(lines)
+
+    lines.append(f"**Results returned:** {len(results)}")
+
+    for index, item in enumerate(results[:5], start=1):
+        if not isinstance(item, dict):
+            continue
+
+        title = item.get("title") or "Untitled result"
+        url = item.get("url") or ""
+        snippet = item.get("content") or ""
+        snippet = " ".join(str(snippet).split())
+
+        if len(snippet) > 450:
+            snippet = snippet[:450].rstrip() + "…"
+
+        lines.append(f"**{index}. {title}**")
+        if url:
+            lines.append(f"Source: {url}")
+        if snippet:
+            lines.append(str(snippet))
+
+    return "\n\n".join(lines)
+
+
+def summarize_tool_result(tool_name: str, content: Any) -> str:
+    """Create a concise observation for the Streamlit activity log."""
+    if tool_name == "tavily_search":
+        return summarize_tavily_result(content)
+
+    text = content_to_text(content)
+    if len(text) > 2500:
+        return text[:2500].rstrip() + "…"
+    return text
+
+
+def extract_agent_output(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Extract the final AI response and concise tool activity from create_agent output."""
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+
+    # Match tool-call IDs to their original names and arguments.
+    tool_calls_by_id: dict[str, dict[str, Any]] = {}
+    for message in messages:
+        for tool_call in getattr(message, "tool_calls", []) or []:
+            call_id = tool_call.get("id")
+            if call_id:
+                tool_calls_by_id[call_id] = tool_call
+
+    steps: list[dict[str, Any]] = []
+
+    for message in messages:
+        if getattr(message, "type", "") != "tool":
+            continue
+
+        call_id = getattr(message, "tool_call_id", None)
+        tool_call = tool_calls_by_id.get(call_id, {})
+
+        tool_name = (
+            getattr(message, "name", None)
+            or tool_call.get("name")
+            or "tool"
+        )
+        tool_input = tool_call.get("args") or {}
+        observation = summarize_tool_result(
+            tool_name,
+            getattr(message, "content", ""),
+        )
+
+        steps.append(
+            {
+                "tool": tool_name,
+                "tool_input": tool_input,
+                "observation": observation,
+            }
+        )
+
+    # The final answer is the last AI message that is not another tool call.
+    final_answer = ""
+    for message in reversed(messages):
+        if getattr(message, "type", "") != "ai":
+            continue
+        if getattr(message, "tool_calls", None):
+            continue
+
+        candidate = content_to_text(getattr(message, "content", ""))
+        if candidate.strip():
+            final_answer = candidate.strip()
+            break
+
+    if not final_answer:
+        final_answer = "The agent did not return a final answer."
+
+    return final_answer, steps
+
+
+# =============================================================================
 # SIDEBAR: CONFIGURATION STATUS
-# ============================================================
+# =============================================================================
 
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -284,13 +429,22 @@ with st.sidebar:
     if ENV_PATH:
         st.write("Environment file:", str(ENV_PATH))
     else:
-        st.warning("No .env file was found. Checking system environment variables.")
+        st.warning(
+            "No .env file was found. Checking system environment variables."
+        )
 
-    st.write("OpenAI API key:", "✅ Loaded" if OPENAI_API_KEY else "❌ Not found")
-    st.write("Tavily API key:", "✅ Loaded" if TAVILY_API_KEY else "❌ Not found")
+    st.write(
+        "OpenAI API key:",
+        "✅ Loaded" if OPENAI_API_KEY else "❌ Not found",
+    )
+    st.write(
+        "Tavily API key:",
+        "✅ Loaded" if TAVILY_API_KEY else "❌ Not found",
+    )
     st.write(
         "Weatherstack API key:",
-        "✅ Loaded" if WEATHERSTACK_API_KEY else "⚠️ Not found — weather disabled",
+        "✅ Loaded" if WEATHERSTACK_API_KEY
+        else "⚠️ Not found — weather disabled",
     )
     st.write("OpenAI model:", f"`{OPENAI_MODEL}`")
 
@@ -298,9 +452,9 @@ with st.sidebar:
     st.caption("Your API keys are never displayed in this app.")
 
 
-# ============================================================
+# =============================================================================
 # USER INPUT
-# ============================================================
+# =============================================================================
 
 st.subheader("What would you like the agent to do?")
 
@@ -323,9 +477,9 @@ if not WEATHERSTACK_API_KEY:
     )
 
 
-# ============================================================
+# =============================================================================
 # RUN THE AGENT
-# ============================================================
+# =============================================================================
 
 if run_agent:
     if not user_query.strip():
@@ -352,36 +506,54 @@ if run_agent:
                 with st.spinner(
                     "Agent is thinking... Searching the web and gathering information."
                 ):
-                    executor = build_agent_executor(
+                    agent = build_agent(
                         OPENAI_API_KEY,
                         TAVILY_API_KEY,
                         WEATHERSTACK_API_KEY,
                         OPENAI_MODEL,
                     )
-                    result = executor.invoke({"input": user_query.strip()})
+
+                    result = agent.invoke(
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": user_query.strip(),
+                                }
+                            ]
+                        },
+                        config={"recursion_limit": 12},
+                    )
+
+                final_answer, steps = extract_agent_output(result)
 
                 st.session_state["last_question"] = user_query.strip()
-                st.session_state["last_answer"] = result.get(
-                    "output",
-                    "The agent did not return an answer.",
-                )
-                st.session_state["last_steps"] = result.get(
-                    "intermediate_steps",
-                    [],
-                )
+                st.session_state["last_answer"] = final_answer
+                st.session_state["last_steps"] = steps
 
             except Exception as exc:
                 st.error("The agent encountered an error.")
                 st.caption(
-                    "Check that your API keys, model access and installed "
-                    "LangChain packages are configured correctly."
+                    "Check your API keys, model access and installed "
+                    "LangChain packages."
                 )
-                st.code(f"{type(exc).__name__}: {exc}")
+
+                # Avoid accidentally displaying an API key in an error message.
+                safe_error = str(exc)
+                for secret in (
+                    OPENAI_API_KEY,
+                    TAVILY_API_KEY,
+                    WEATHERSTACK_API_KEY,
+                ):
+                    if secret:
+                        safe_error = safe_error.replace(secret, "[REDACTED]")
+
+                st.code(f"{type(exc).__name__}: {safe_error}")
 
 
-# ============================================================
+# =============================================================================
 # DISPLAY THE RESULT
-# ============================================================
+# =============================================================================
 
 if st.session_state.get("last_answer"):
     st.divider()
@@ -389,12 +561,23 @@ if st.session_state.get("last_answer"):
     st.markdown(st.session_state["last_answer"])
 
     steps = st.session_state.get("last_steps", [])
-    if steps:
-        with st.expander("🔎 View agent activity"):
-            for index, (action, observation) in enumerate(steps, start=1):
-                st.markdown(f"**Step {index}: `{action.tool}`**")
-                st.caption(f"Tool input: {action.tool_input}")
-                st.write(observation)
+
+    with st.expander("🔎 View agent activity"):
+        if not steps:
+            st.caption("The agent answered without calling an external tool.")
+        else:
+            for index, step in enumerate(steps, start=1):
+                st.markdown(f"**Step {index}: `{step['tool']}`**")
+
+                st.caption("Tool input:")
+                if isinstance(step["tool_input"], (dict, list)):
+                    st.json(step["tool_input"])
+                else:
+                    st.write(step["tool_input"])
+
+                st.markdown("**Tool result summary:**")
+                st.markdown(step["observation"])
+
                 if index < len(steps):
                     st.divider()
 

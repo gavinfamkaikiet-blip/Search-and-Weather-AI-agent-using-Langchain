@@ -4,7 +4,8 @@ python-dotenv>=1.0,<2.0
 requests>=2.32.3,<3.0
 certifi>=2024.6.2
 
-# Compatible LangChain 1.x stack
+# LangChain 1.x agent stack
+langchain==1.5.2
 langchain-core>=1.7.5,<2.0
 langchain-openai==1.8.3
 langchain-tavily==0.2.18
