@@ -1,0 +1,11 @@
+# Streamlit UI
+streamlit>=1.45,<2.0
+python-dotenv>=1.0,<2.0
+requests>=2.32.3,<3.0
+certifi>=2024.6.2
+
+# Compatible LangChain 1.x stack
+langchain-core>=1.7.5,<2.0
+langchain-openai==1.8.3
+langchain-tavily==0.2.18
+langchain-classic==1.0.8
