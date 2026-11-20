@@ -245,7 +245,6 @@ def build_agent_executor(
         model=model_name,
         api_key=openai_key,
         use_responses_api=True,
-        temperature=0,
     )
 
     # Same Tavily integration and max_results setting as the notebook.
